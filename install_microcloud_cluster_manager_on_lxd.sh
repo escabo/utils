@@ -1,11 +1,20 @@
 #!/bin/bash
+set -u
+
+# This script deploys a microcloud cluster-manager on Canonical k8s VMs
+# running inside LXD. It creates a dedicated LXD network, project and profile, createsVMs,
+# configures microceph or uses the LXD CSI for the k8s cluster, then installs juju,
+# a juju controller, cluster manager dependencies, keycloak for identity and the
+# cluster manager itself.
+#
+# You can delete everything created by running the script with the -d option.
 
 EXPECT_EXIST=false                  # determines if we assume the elements exist or
-                                    # not. when false we expect an empty environement
+                                    # not. when false we expect an empty environment
                                     # and create the project, the profile ... etc.
                                     # when true, we assume the env exists and we delete it
 PROJECT=k8s-project                 # LXD project in which to create everything
-NETWORK=br0                         # LXD network used for the project and the k8s VMs
+NETWORK=lxdbr2                      # LXD network used for the project and the k8s VMs
 VM_STORAGE_POOL=default             # storage pool for VM creation
 PROFILE=k8s-profile                 # profile for k8s VMs
 
@@ -21,34 +30,61 @@ CSI_STORAGE_POOL=default            # storage pool for LXD's CSI (when not usein
 AUTHGROUP=k8s-group                 # identity and permissions for LXD's CSI
 DEVLXDID=csi
 CSINAMESPACE=lxd-csi                # k8s namespace for LXD's CSI, matches what is in the helm chart
+                                    
+METALLB_IP_RANGE=                   # must be reserved on $NETWORK above
 
-                                    # must be reserved on $NETWORK above
-METALLB_IP_RANGE=192.168.67.50-192.168.67.59
+JUJUCTRL=k8s-on-lxd                 # juju controller on k8s
 
-JUJUCTRL=k8s-on-sm                  # juju controller on k8s
+USERNAME="${USERNAME:-$(whoami)}"   # regular user created in k8s VMs
+                                    # also used as juju user and keycloak user                                    
 
-if [ -z ${USERNAME} ]; then         # regular user created in k8s VMs
-    USERNAME=egelinas
-fi
+LP_USER="${LP_USER:-${USERNAME}}"   # regular user's launchpad account to get SSH key
 
-if [ -z ${LP_USER} ]; then          # regular user's launchpad account to get SSH key
-    LP_USER=egelinas
-fi
-
-FIRST_NAME=Eric                     # keycloak user
-LAST_NAME=Gelinas
-EMAIL=eric.gelinas@canonical.com
-PASSWORD=ubuntu
+FIRST_NAME=First                    # keycloak user
+LAST_NAME=Last
+EMAIL=first.last@noreply.com
+PASSWORD="$(openssl rand -base64 12)"
 
 # TODO
 #
 # single node ceph is not possible
 # requires latest lxd, check for that
-# VM Ready will only work on first boot.
-# jq not available on jammy
-# lxc_exec vs sudo_k8s and jq commands
+# VM Ready will only work on first boot
+
+# COMMENTS
+#
+# can't use set -e because k8s and microceph test for failure of the command to decide
 
 # ------------------------------------------------------------------------------
+
+# jq is available on ubuntu:noble which is used to create VMs
+
+check_dependencies() {
+    local deps=("openssl" "lxc" "jq" "curl" "snap")
+    for dep in "${deps[@]}"; do
+        command -v "$dep" >/dev/null 2>&1 || {
+            echo "Error: $dep is required but not installed." >&2
+            exit 1
+        }
+    done
+}
+
+delete_network() {
+    lxc network delete "${NETWORK}"
+}
+
+network() {
+
+    if [[ "$(lxc network list -f json | jq "[.[].name] | any(. == \"${NETWORK}\")")" == "${EXPECT_EXIST}" ]]; then
+        if [[ "${EXPECT_EXIST}" == "false" ]]; then
+            lxc network create "${NETWORK}" ipv4.address="10.101.18.1/24" ipv4.nat=true ipv6.address="none"
+            lxc network set "${NETWORK}" ipv4.dhcp.ranges="10.101.18.40-10.101.18.180"
+            METALLB_IP_RANGE=10.101.18.30-10.101.18.39
+        else
+            trap delete_network EXIT
+        fi
+    fi
+}
 
 # functions use the same pattern and are built to be idempotent.
 # we first validate the assumption (if items are expected to be present or not)
@@ -59,15 +95,15 @@ PASSWORD=ubuntu
 
 project() {
     
-    if [[ "$(lxc project list -f json | jq "[.[].name] | any(. == \"${PROJECT}\")")" == ${EXPECT_EXIST} ]]; then
+    if [[ "$(lxc project list -f json | jq "[.[].name] | any(. == \"${PROJECT}\")")" == "${EXPECT_EXIST}" ]]; then
 
         # here our assumption tested true, we create the project if it does not exist
         # and delete it if it does.
 
-        if [[ ${EXPECT_EXIST} == "false" ]]; then
-            lxc project create ${PROJECT} -n ${NETWORK} -s ${VM_STORAGE_POOL}
+        if [[ "${EXPECT_EXIST}" == "false" ]]; then
+            lxc project create "${PROJECT}" -n "${NETWORK}" -s "${VM_STORAGE_POOL}"
         else
-            lxc project delete ${PROJECT} -f
+            lxc project delete "${PROJECT}" -f
         fi
 
         # there is nothing to do if our assumption is wrong. expect == false means we need to create the
@@ -85,8 +121,8 @@ vm_profile() {
     # it also sets the right flags for VMs to access /dev/lxd for the CSI
     
     if [[ "$(lxc project list -f json | jq "[.[].name] | any(. == \"${PROJECT}\")")" == "true" ]]; then
-        if [[ "$(lxc profile list --project ${PROJECT} -f json | jq "[.[].name] | any(. == \"${PROFILE}\")")" == ${EXPECT_EXIST} ]]; then    
-            if [[ ${EXPECT_EXIST} == "false" ]]; then
+        if [[ "$(lxc profile list --project ${PROJECT} -f json | jq "[.[].name] | any(. == \"${PROFILE}\")")" == "${EXPECT_EXIST}" ]]; then
+            if [[ "${EXPECT_EXIST}" == "false" ]]; then
                 cat <<EOF > profile.yaml
 config:
   cloud-init.network-config: |
@@ -127,7 +163,7 @@ devices:
 name: ${PROFILE}
 EOF
                 # < profile.yaml bugs with /dev/stdin not being readable
-                cat profile.yaml | lxc profile create ${PROFILE} --project ${PROJECT}
+                cat profile.yaml | lxc profile create "${PROFILE}" --project "${PROJECT}"
                 rm profile.yaml
             fi
         fi
@@ -136,27 +172,27 @@ EOF
 
 group_and_permissions() {
 
-    if [[ "$(lxc auth group list -f json | jq "[.[].name] | any(. == \"${AUTHGROUP}\")")" == ${EXPECT_EXIST} ]]; then
-        if [[ ${EXPECT_EXIST} == "false" ]]; then
-            lxc auth group create ${AUTHGROUP}
+    if [[ "$(lxc auth group list -f json | jq "[.[].name] | any(. == \"${AUTHGROUP}\")")" == "${EXPECT_EXIST}" ]]; then
+        if [[ "${EXPECT_EXIST}" == "false" ]]; then
+            lxc auth group create "${AUTHGROUP}"
         
-            lxc auth group permission add ${AUTHGROUP} project ${PROJECT} can_view
-            lxc auth group permission add ${AUTHGROUP} project ${PROJECT} storage_volume_manager
-            lxc auth group permission add ${AUTHGROUP} project ${PROJECT} can_edit_instances
+            lxc auth group permission add "${AUTHGROUP}" project "${PROJECT}" can_view
+            lxc auth group permission add "${AUTHGROUP}" project "${PROJECT}" storage_volume_manager
+            lxc auth group permission add "${AUTHGROUP}" project "${PROJECT}" can_edit_instances
         else
             # project will have been deleted
-            lxc auth group delete ${AUTHGROUP}
+            lxc auth group delete "${AUTHGROUP}"
         fi  
     fi
 }
 
 identity() {
 
-    if [[ "$(lxc auth identity list -f json | jq "[.[].name] | any(. == \"${DEVLXDID}\")")" == ${EXPECT_EXIST} ]]; then    
-        if [[ ${EXPECT_EXIST} == "false" ]]; then
+    if [[ "$(lxc auth identity list -f json | jq "[.[].name] | any(. == \"${DEVLXDID}\")")" == "${EXPECT_EXIST}" ]]; then
+        if [[ "${EXPECT_EXIST}" == "false" ]]; then
             lxc auth identity create devlxd/${DEVLXDID}
             printf "\n"
-            lxc auth identity group add devlxd/${DEVLXDID} ${AUTHGROUP}
+            lxc auth identity group add devlxd/${DEVLXDID} "${AUTHGROUP}"
             DEVLXD_TOKEN=$(lxc auth identity token issue devlxd/${DEVLXDID} --quiet)
         else
             # group will have been deleted
@@ -167,7 +203,7 @@ identity() {
         # here we need to act on our failed assumption, the identity exists and it's ok
         # but we need to get a token for it
         
-        if [[ ${EXPECT_EXIST} == "false" ]]; then
+        if [[ "${EXPECT_EXIST}" == "false" ]]; then
             DEVLXD_TOKEN=$(lxc auth identity token issue devlxd/${DEVLXDID} --quiet)
         fi
     fi
@@ -176,20 +212,20 @@ identity() {
 vms() {
 
     if [[ "$(lxc project list -f json | jq "[.[].name] | any(. == \"${PROJECT}\")")" == "true" ]]; then
-        for i in ${MEMBERS[@]}; do
-            if [[ "$(lxc list --project ${PROJECT} -f json | jq "[.[].name] | any(. == \"${i}\")")" == "false" ]]; then    
-                lxc init ubuntu:noble ${i} --project ${PROJECT} --profile ${PROFILE} --vm
+        for i in "${MEMBERS[@]}"; do
+            if [[ "$(lxc list --project "${PROJECT}" -f json | jq "[.[].name] | any(. == \"${i}\")")" == "false" ]]; then
+                lxc init ubuntu:noble "${i}" --project "${PROJECT}" --profile "${PROFILE}" --vm
                 if [[ "${MICROCEPH}" == "true" ]]; then
-                    lxc storage volume create ${VM_STORAGE_POOL} --project ${PROJECT} ${i}ceph size=${OSD_SIZE} --type=block
-                    lxc config device add ${i} disk${i} disk --project ${PROJECT} pool=${VM_STORAGE_POOL} source=${i}ceph
+                    lxc storage volume create "${VM_STORAGE_POOL}" --project "${PROJECT}" "${i}ceph" size="${OSD_SIZE}" --type=block
+                    lxc config device add "${i}" "disk${i}" disk --project "${PROJECT}" pool="${VM_STORAGE_POOL}" source="${i}ceph"
                 fi
-                lxc start ${i} --project ${PROJECT}
+                lxc start "${i}" --project "${PROJECT}"
             fi
         done
 
         # waiting for all machines to be ready
         
-        while [[ "$(lxc list --project ${PROJECT} -f json | jq "[.[].status] | all(. == \"Ready\")")" == "false" ]]; do
+        while [[ "$(lxc list --project "${PROJECT}" -f json | jq "[.[].status] | all(. == \"Ready\")")" == "false" ]]; do
             echo "Waiting for VMs to be ready"
             sleep 10
         done
@@ -200,11 +236,11 @@ vms() {
 # lxc_exec* are not used when the command needs to be executed on another node than the main one
 
 lxc_exec() {
-    lxc exec ${MEMBERS[0]} --project ${PROJECT} -- ${1}
+    lxc exec "${MEMBERS[0]}" --project "${PROJECT}" -- ${1}
 }
 
 lxc_exec_user() {
-    lxc exec ${MEMBERS[0]} --project ${PROJECT} -- su - ${USERNAME} -c "${1}"
+    lxc exec "${MEMBERS[0]}" --project "${PROJECT}" -- su - "${USERNAME}" -c "${1}"
 }
 
 sudo_microceph() {
@@ -232,9 +268,9 @@ k8s_cluster() {
             sudo_k8s "bootstrap"
 
             # add all other nodes to the main one
-            for (( i=1; i<${#MEMBERS[@]}; i++ )); do
+            for (( i=1; i<"${#MEMBERS[@]}"; i++ )); do
                 JOIN_TOKEN=$(sudo_k8s "get-join-token ${MEMBERS[$i]}")
-                lxc exec ${MEMBERS[$i]} --project ${PROJECT} -- su - ${USERNAME} -c "sudo k8s join-cluster ${JOIN_TOKEN}"
+                lxc exec "${MEMBERS[$i]}" --project "${PROJECT}" -- su - "${USERNAME}" -c "sudo k8s join-cluster ${JOIN_TOKEN}"
             done
 
             sudo_k8s "status --wait-ready"
@@ -259,14 +295,14 @@ microceph_cluster() {
             sudo_microceph "cluster bootstrap"
 
             # add all other nodes to the main one
-            for (( i=1; i<${#MEMBERS[@]}; i++ )); do
+            for (( i=1; i<"${#MEMBERS[@]}"; i++ )); do
                 JOIN_TOKEN=$(sudo_microceph "cluster add ${MEMBERS[$i]}")
-                lxc exec ${MEMBERS[$i]} --project ${PROJECT} -- su - ${USERNAME} -c "sudo microceph cluster join ${JOIN_TOKEN}"
+                lxc exec "${MEMBERS[$i]}" --project "${PROJECT}" -- su - "${USERNAME}" -c "sudo microceph cluster join ${JOIN_TOKEN}"
             done
 
             # add OSDs
-            for i in ${MEMBERS[@]}; do
-                lxc exec ${i} --project ${PROJECT} -- su - ${USERNAME} -c "sudo microceph disk add /dev/sdb --wipe"
+            for i in "${MEMBERS[@]}"; do
+                lxc exec "${i}" --project "${PROJECT}" -- su - "${USERNAME}" -c "sudo microceph disk add /dev/sdb --wipe"
             done
 
             lxc_exec "ceph osd pool create kubernetes 128"
@@ -300,7 +336,7 @@ metadata:
   name: ceph-csi-config
 EOF
 
-            lxc file push csi-config-map.yaml --project ${PROJECT} ${MEMBERS[0]}/home/${USERNAME}/csi-config-map.yaml
+            lxc file push csi-config-map.yaml --project "${PROJECT}" "${MEMBERS[0]}/home/${USERNAME}/csi-config-map.yaml"
             sudo_k8s "kubectl apply -f csi-config-map.yaml"
             rm csi-config-map.yaml
 
@@ -317,7 +353,7 @@ metadata:
   name: ceph-csi-encryption-kms-config
 EOF
 
-            lxc file push csi-kms-config-map.yaml --project ${PROJECT} ${MEMBERS[0]}/home/${USERNAME}/csi-kms-config-map.yaml
+            lxc file push csi-kms-config-map.yaml --project "${PROJECT}" "${MEMBERS[0]}/home/${USERNAME}/csi-kms-config-map.yaml"
             sudo_k8s "kubectl apply -f csi-kms-config-map.yaml"
             rm csi-kms-config-map.yaml
 
@@ -339,12 +375,12 @@ metadata:
   name: ceph-config
 EOF
 
-            lxc file push ceph-config-map.yaml --project ${PROJECT} ${MEMBERS[0]}/home/${USERNAME}/ceph-config-map.yaml
+            lxc file push ceph-config-map.yaml --project "${PROJECT}" "${MEMBERS[0]}/home/${USERNAME}/ceph-config-map.yaml"
             sudo_k8s "kubectl apply -f ceph-config-map.yaml"
             rm ceph-config-map.yaml
 
             # 4) (tried using lxc_exec without sucess - quoting issue)
-            SECRET_KEY=$(lxc exec ${MEMBERS[0]} --project ${PROJECT} -- ceph auth get-or-create client.kubernetes mon 'profile rbd' osd 'profile rbd pool=kubernetes' mgr 'profile rbd pool=kubernetes' -f json | jq '.[].key')
+            SECRET_KEY=$(lxc exec "${MEMBERS[0]}" --project "${PROJECT}" -- ceph auth get-or-create client.kubernetes mon 'profile rbd' osd 'profile rbd pool=kubernetes' mgr 'profile rbd pool=kubernetes' -f json | jq '.[].key')
             
             cat <<EOF > csi-rbd-secret.yaml
 ---
@@ -358,7 +394,7 @@ stringData:
   userKey: ${SECRET_KEY}
 EOF
 
-            lxc file push csi-rbd-secret.yaml --project ${PROJECT} ${MEMBERS[0]}/home/${USERNAME}/csi-rbd-secret.yaml
+            lxc file push csi-rbd-secret.yaml --project "${PROJECT}" "${MEMBERS[0]}/home/${USERNAME}/csi-rbd-secret.yaml"
             sudo_k8s "kubectl apply -f csi-rbd-secret.yaml"
             rm csi-rbd-secret.yaml
 
@@ -399,7 +435,7 @@ mountOptions:
    - discard
 EOF
 
-            lxc file push csi-rbd-sc.yaml --project ${PROJECT} ${MEMBERS[0]}/home/${USERNAME}/csi-rbd-sc.yaml
+            lxc file push csi-rbd-sc.yaml --project "${PROJECT}" "${MEMBERS[0]}/home/${USERNAME}/csi-rbd-sc.yaml"
             sudo_k8s "kubectl apply -f csi-rbd-sc.yaml"
             rm csi-rbd-sc.yaml
 
@@ -433,7 +469,7 @@ parameters:
   storagePool: "${CSI_STORAGE_POOL}"
 EOF
 
-            lxc file push csi-sc.yaml --project ${PROJECT} ${MEMBERS[0]}/home/${USERNAME}/csi-sc.yaml
+            lxc file push csi-sc.yaml --project "${PROJECT}" "${MEMBERS[0]}/home/${USERNAME}/csi-sc.yaml"
             sudo_k8s "kubectl apply -f csi-sc.yaml"
             rm csi-sc.yaml
 
@@ -478,32 +514,38 @@ keycloak() {
     if [[ "$(lxc project list -f json | jq "[.[].name] | any(. == \"${PROJECT}\")")" == "true" ]]; then
 
         sudo_k8s "kubectl apply -f https://raw.githubusercontent.com/keycloak/keycloak-quickstarts/refs/heads/main/kubernetes/keycloak.yaml"
-        # expose the UI via metal-lb
-        sudo_k8s "kubectl patch service keycloak --type merge -p '{\"spec\":{\"type\":\"LoadBalancer\"}}'"
+
         
         while [[ "$(sudo_k8s "kubectl get services -o json | jq '[.items[].metadata.name] | any(. == \"keycloak\")'")" == "false" ]]; do
-            echo "Waiting for keyclock service to be ready"
+            echo "Waiting for keycloak service to be ready"
             sleep 10
         done
 
+        # expose the UI via metal-lb
+        sudo_k8s "kubectl patch service keycloak --type merge -p '{\"spec\":{\"type\":\"LoadBalancer\"}}'"
+
         while [[ "$(sudo_k8s "kubectl get services -o json | jq '.items[] | select(.metadata.name == \"keycloak\") | .status.loadBalancer.ingress[0].ip'")" == "null" ]]; do
-            echo "Waiting for LoadBalancer IP"
+            echo "Waiting for Keycloak LB IP"
             sleep 10
         done
         
         # use jq -r to remove quotes from IPs and ACCESS_TOKEN
         
         KEYCLOAK_IP=$(sudo_k8s "kubectl get services -o json | jq -r '.items[] | select(.metadata.name == \"keycloak\") | .status.loadBalancer.ingress[0].ip'")
-        echo Keycloak: ${KEYCLOAK_IP}
+        echo Keycloak: http://${KEYCLOAK_IP}:8080
         
+        while [[ "$(sudo_k8s "kubectl get services -n cluster-manager -o json | jq '.items[] | select(.metadata.name == \"traefik-k8s-lb\") | .status.loadBalancer.ingress[0].ip'")" == "null" ]]; do
+            echo "Waiting for Traefik LB IP"
+            sleep 10
+        done
+
         CLUSTER_MANAGER_IP=$(sudo_k8s "kubectl get services -n cluster-manager -o json | jq -r '.items[] | select(.metadata.name == \"traefik-k8s-lb\") | .status.loadBalancer.ingress[0].ip'")
-        echo Cluster Manager: ${CLUSTER_MANAGER_IP}
+        echo Cluster Manager: https://${CLUSTER_MANAGER_IP}
 
         ACCESS_TOKEN=$(curl --silent --request POST http://${KEYCLOAK_IP}:8080/realms/master/protocol/openid-connect/token -H "Content-Type: application/x-www-form-urlencoded" --data "client_id=admin-cli&grant_type=password&username=admin&password=admin" | jq -r ".access_token")
         echo Access Token: ${ACCESS_TOKEN}
 
         # create realm, clientid and user
-        # lxd suite my_curl
         
         HTTP_STATUS=$(curl --silent -o /dev/null -w "%{http_code}" --request GET http://${KEYCLOAK_IP}:8080/admin/realms/lxd-ui-realm --header "Authorization: Bearer ${ACCESS_TOKEN}")
         
@@ -517,6 +559,7 @@ keycloak() {
 
             HTTP_STATUS=$(curl --silent -o /dev/null -w "%{http_code}" --request POST http://${KEYCLOAK_IP}:8080/admin/realms/lxd-ui-realm/users --header "Content-Type: application/json" --header "Authorization: Bearer ${ACCESS_TOKEN}" --data "{ \"username\": \"${USERNAME}\", \"email\": \"${EMAIL}\", \"enabled\": true, \"firstName\": \"${FIRST_NAME}\", \"lastName\": \"${LAST_NAME}\", \"credentials\": [ {\"type\": \"password\", \"value\": \"${PASSWORD}\", \"temporary\": false} ] }")
             echo "Create User ${HTTP_STATUS}"
+            echo Password: ${PASSWORD}
         fi
     fi
 }
@@ -549,6 +592,9 @@ while getopts "d" arg; do
   esac
 done
 
+check_dependencies
+
+network
 project
 vm_profile
 group_and_permissions
