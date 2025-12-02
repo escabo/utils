@@ -505,6 +505,16 @@ cluster_manager_dependencies() {
             lxc_exec_user "juju deploy postgresql-k8s --channel 14/stable --trust"
             lxc_exec_user "juju deploy self-signed-certificates --trust"
             lxc_exec_user "juju deploy traefik-k8s --trust"
+
+            while [[ "$(lxc_exec_user "juju status traefik-k8s --format json | jq -r '.applications[].\"application-status\".current'")" != "active" ]]; do
+                echo "Waiting for Traefik to be ready"
+                sleep 10
+            done
+
+            # use jq -r to remove quotes from IP
+
+            CLUSTER_MANAGER_IP=$(sudo_k8s "kubectl get services -n cluster-manager -o json | jq -r '.items[] | select(.metadata.name == \"traefik-k8s-lb\") | .status.loadBalancer.ingress[0].ip'")
+            echo Cluster Manager: https://${CLUSTER_MANAGER_IP}
         fi
     fi
 }
@@ -515,7 +525,6 @@ keycloak() {
 
         sudo_k8s "kubectl apply -f https://raw.githubusercontent.com/keycloak/keycloak-quickstarts/refs/heads/main/kubernetes/keycloak.yaml"
 
-        
         while [[ "$(sudo_k8s "kubectl get services -o json | jq '[.items[].metadata.name] | any(. == \"keycloak\")'")" == "false" ]]; do
             echo "Waiting for keycloak service to be ready"
             sleep 10
@@ -534,14 +543,6 @@ keycloak() {
         KEYCLOAK_IP=$(sudo_k8s "kubectl get services -o json | jq -r '.items[] | select(.metadata.name == \"keycloak\") | .status.loadBalancer.ingress[0].ip'")
         echo Keycloak: http://${KEYCLOAK_IP}:8080
         
-        while [[ "$(sudo_k8s "kubectl get services -n cluster-manager -o json | jq '.items[] | select(.metadata.name == \"traefik-k8s-lb\") | .status.loadBalancer.ingress[0].ip'")" == "null" ]]; do
-            echo "Waiting for Traefik LB IP"
-            sleep 10
-        done
-
-        CLUSTER_MANAGER_IP=$(sudo_k8s "kubectl get services -n cluster-manager -o json | jq -r '.items[] | select(.metadata.name == \"traefik-k8s-lb\") | .status.loadBalancer.ingress[0].ip'")
-        echo Cluster Manager: https://${CLUSTER_MANAGER_IP}
-
         ACCESS_TOKEN=$(curl --silent --request POST http://${KEYCLOAK_IP}:8080/realms/master/protocol/openid-connect/token -H "Content-Type: application/x-www-form-urlencoded" --data "client_id=admin-cli&grant_type=password&username=admin&password=admin" | jq -r ".access_token")
         echo Access Token: ${ACCESS_TOKEN}
 
