@@ -275,6 +275,7 @@ k8s_cluster() {
 
             sudo_k8s "status --wait-ready"
 
+            # test for timeout / failure of the above
             # for helm + juju
             
             lxc_exec_user "mkdir -p ~/.kube"
@@ -510,12 +511,10 @@ cluster_manager_dependencies() {
                 echo "Waiting for Traefik to be ready"
                 sleep 10
             done
-
-            # use jq -r to remove quotes from IP
-
-            CLUSTER_MANAGER_IP=$(sudo_k8s "kubectl get services -n cluster-manager -o json | jq -r '.items[] | select(.metadata.name == \"traefik-k8s-lb\") | .status.loadBalancer.ingress[0].ip'")
-            echo Cluster Manager: https://${CLUSTER_MANAGER_IP}
         fi
+        # use jq -r to remove quotes from IP
+        CLUSTER_MANAGER_IP=$(sudo_k8s "kubectl get services -n cluster-manager -o json | jq -r '.items[] | select(.metadata.name == \"traefik-k8s-lb\") | .status.loadBalancer.ingress[0].ip'")
+        echo Cluster Manager URL: https://${CLUSTER_MANAGER_IP}
     fi
 }
 
@@ -526,22 +525,22 @@ keycloak() {
         sudo_k8s "kubectl apply -f https://raw.githubusercontent.com/keycloak/keycloak-quickstarts/refs/heads/main/kubernetes/keycloak.yaml"
 
         while [[ "$(sudo_k8s "kubectl get services -o json | jq '[.items[].metadata.name] | any(. == \"keycloak\")'")" == "false" ]]; do
-            echo "Waiting for keycloak service to be ready"
+            echo "Waiting for keycloak service to be up"
             sleep 10
         done
 
         # expose the UI via metal-lb
         sudo_k8s "kubectl patch service keycloak --type merge -p '{\"spec\":{\"type\":\"LoadBalancer\"}}'"
 
-        while [[ "$(sudo_k8s "kubectl get services -o json | jq '.items[] | select(.metadata.name == \"keycloak\") | .status.loadBalancer.ingress[0].ip'")" == "null" ]]; do
-            echo "Waiting for Keycloak LB IP"
+        while [[ "$(sudo_k8s "kubectl get statefulset keycloak -o json | jq '.status.availableReplicas'")" -eq 0 ]]; do
+            echo "Waiting for Keycloak app to be ready"
             sleep 10
         done
         
         # use jq -r to remove quotes from IPs and ACCESS_TOKEN
         
         KEYCLOAK_IP=$(sudo_k8s "kubectl get services -o json | jq -r '.items[] | select(.metadata.name == \"keycloak\") | .status.loadBalancer.ingress[0].ip'")
-        echo Keycloak: http://${KEYCLOAK_IP}:8080
+        echo Keycloak URL: http://${KEYCLOAK_IP}:8080
         
         ACCESS_TOKEN=$(curl --silent --request POST http://${KEYCLOAK_IP}:8080/realms/master/protocol/openid-connect/token -H "Content-Type: application/x-www-form-urlencoded" --data "client_id=admin-cli&grant_type=password&username=admin&password=admin" | jq -r ".access_token")
         echo Access Token: ${ACCESS_TOKEN}
@@ -550,7 +549,7 @@ keycloak() {
         
         HTTP_STATUS=$(curl --silent -o /dev/null -w "%{http_code}" --request GET http://${KEYCLOAK_IP}:8080/admin/realms/lxd-ui-realm --header "Authorization: Bearer ${ACCESS_TOKEN}")
         
-        if [ ${HTTP_STATUS} -ne 200 ]; then
+        if [[ ${HTTP_STATUS} -ne 200 ]]; then
             
             HTTP_STATUS=$(curl --silent -o /dev/null -w "%{http_code}" --request POST http://${KEYCLOAK_IP}:8080/admin/realms --header "Content-Type: application/json" --header "Authorization: Bearer ${ACCESS_TOKEN}" --data "{ \"realm\" : \"lxd-ui-realm\", \"enabled\" : true }")
             echo "Create Realm ${HTTP_STATUS}"
@@ -560,7 +559,7 @@ keycloak() {
 
             HTTP_STATUS=$(curl --silent -o /dev/null -w "%{http_code}" --request POST http://${KEYCLOAK_IP}:8080/admin/realms/lxd-ui-realm/users --header "Content-Type: application/json" --header "Authorization: Bearer ${ACCESS_TOKEN}" --data "{ \"username\": \"${USERNAME}\", \"email\": \"${EMAIL}\", \"enabled\": true, \"firstName\": \"${FIRST_NAME}\", \"lastName\": \"${LAST_NAME}\", \"credentials\": [ {\"type\": \"password\", \"value\": \"${PASSWORD}\", \"temporary\": false} ] }")
             echo "Create User ${HTTP_STATUS}"
-            echo Password: ${PASSWORD}
+            echo User Password: ${PASSWORD}
         fi
     fi
 }
@@ -579,6 +578,37 @@ cluster_manager() {
                 lxc_exec_user "juju integrate postgresql-k8s:database microcloud-cluster-manager-k8s"
                 lxc_exec_user "juju integrate self-signed-certificates:certificates microcloud-cluster-manager-k8s"
                 lxc_exec_user "juju integrate traefik-k8s:traefik-route microcloud-cluster-manager-k8s"
+        fi
+    fi
+}
+
+cos() {
+
+    if [[ "$(lxc project list -f json | jq "[.[].name] | any(. == \"${PROJECT}\")")" == "true" ]]; then
+        if [[ "$(lxc_exec_user "juju list-models --format json | jq '[.models[].name] | any(. == \"admin/cluster-manager\")'")" == "true" ]]; then
+            lxc_exec_user "juju add-model cos"
+            lxc_exec_user "juju deploy cos-lite --trust"
+            lxc_exec_user "juju offer prometheus:receive-remote-write"
+            lxc_exec_user "juju offer grafana:grafana-dashboard grafana-db"
+            lxc_exec_user "juju offer grafana:grafana-metadata"
+
+            lxc_exec_user "juju switch cluster-manager"
+
+            lxc_exec_user "juju integrate microcloud-cluster-manager-k8s:send-remote-write admin/cos.prometheus"
+            lxc_exec_user "juju integrate microcloud-cluster-manager-k8s:grafana-dashboard admin/cos.grafana-db"
+            lxc_exec_user "juju integrate microcloud-cluster-manager-k8s:grafana-metadata admin/cos.grafana"
+
+            while [[ "$(lxc_exec_user "juju status --model cos grafana --format json | jq -r '.applications[].\"application-status\".current'")" != "active" ]]; do
+                echo "Waiting for Grafana to be ready"
+                sleep 10
+            done
+
+            GRAFANA_PW=$(lxc_exec_user "juju run --quiet --format json --model cos grafana/leader get-admin-password | jq -r '.\"grafana/0\".results.\"admin-password\"'")
+            GRAFANA_URL=$(lxc_exec_user "juju run --quiet --format json --model cos grafana/leader get-admin-password | jq -r '.\"grafana/0\".results.url'")
+
+            echo "Username: admin"
+            echo "Password: ${GRAFANA_PW}"
+            echo "Grafana URL: ${GRAFANA_URL}"
         fi
     fi
 }
@@ -615,3 +645,4 @@ juju
 cluster_manager_dependencies
 keycloak
 cluster_manager
+cos
